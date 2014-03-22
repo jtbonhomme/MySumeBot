@@ -1,15 +1,22 @@
-MySumoBot
-=========
+# MySumoBot
 
 This is simple program for Polulo Zumo robot (http://www.pololu.com)
 
-Install
-=======
+# Install
 
-Open MySumoBotAuto.ino into Arduino IDE and upload it in your Robot.
+Open MyZumoBot.ino into Arduino IDE and upload it in your Robot.
 
-Hardware pin configuration
-==========================
+You can install the bluetooth remote server with the following commands:
+
+    % git clone https://github.com/jtbonhomme/botRC.git
+    % cd botRC
+    % npm install
+    % grunt
+    % node api
+
+Then open your chrome browser on http://localhost:3000
+
+# ZumoBot Hardware pin configuration
 
     Arduino analog pin 1   : battery level
     Arduino digital pin 2  : bluetooth HC-06 module Tx (=> arduino Rx)
@@ -24,8 +31,7 @@ Hardware pin configuration
     Arduino digital pin 12 : Zumo User Push Button
     Arduino digital pin 13 : Zumo Yellow LED
 
-Dependencies
-============
+# Dependencies
 
 This program needs external librairies to work properly:
 
