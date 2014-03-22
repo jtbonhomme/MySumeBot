@@ -4,6 +4,8 @@
 #include <LSM303.h>
 #include <stdarg.h>
 #include <SimpleTimer.h>
+#include <SoftwareSerial.h>
+#include <MemoryFree.h>
 
 #define DEBUG_MODE
 
@@ -35,6 +37,7 @@
 // DEFINE
 #define SERIAL_BAUD         9600
 #define SPEED               300
+#define BATTERY_LEVEL       1
 #define BLUETOOTH_RX        2
 #define BUZZER_PIN          3  
 #define SERVO_PIN           4
@@ -42,10 +45,13 @@
 #define BLUETOOTH_TX        11
 #define YELLOW_LED_PIN      13   // Zumo shield yellow led
 
+#define CMD_LEN             4
 #define FWD_DURATION        250
 #define TURN_DURATION       100
 
+#define EMIT_TIMOUT         250 // min delay between two internal status serial sending
 #define DISTANCE_TIMER      200 // max delay between two measurements
+#define CHECK_TIMER         500
 
 #define SERVO_LEFT_POS      700
 #define SERVO_CENTRAL_POS   1500
@@ -73,19 +79,18 @@ LSM303 compass;
 ZumoMotors motors;
 Pushbutton button(ZUMO_BUTTON);
 unsigned char INBYTE;
-unsigned char buffer[7];
+unsigned char buffer[CMD_LEN];
 int index;
-unsigned int batterie           = 0;
+SoftwareSerial SerialBluetooth( BLUETOOTH_RX, BLUETOOTH_TX);
 
 SimpleTimer timer;
-int motor_timer_id              = -1;
-int distance_timer_id           = -1;
+int timer_id              = -1;
 
 int leftDistance, rightDistance, frontDistance;
-int distance;
 unsigned char step              = 0;
 boolean isMoving                = false;
 boolean isTurning               = false;
+boolean isSync                  = false;
 
 // This is the time since the last rising edge in units of 0.5us.
 uint16_t volatile servoTime     = 0;
@@ -113,6 +118,17 @@ void LOG(char *format,...)
 }
 
 /*
+ * publish data through bluetooth serial port
+ */
+void btPublish(char *key, int value) {
+  char buff[128];
+//  sprintf(buff, "{%c%s%c:%d}", 34, key, 34, value);
+  sprintf(buff, "{\"key\":\"%s\", \"value\":%d}", key, value);
+  SerialBluetooth.println(buff);
+//  Serial.println(buff);
+}
+
+/*
  * Setup function, run once, when the sketch starts
  * - Initialize serial port
  */
@@ -121,23 +137,116 @@ void setup() {
 #ifdef DEBUG_MODE
   Serial.begin(SERIAL_BAUD);
 #endif
+  SerialBluetooth.begin(SERIAL_BAUD);
+
+/*  servoInit();
+  servoSetPosition(MAX_SERVO_POSITION/2);*/
 
   button.waitForButton();
+ 
+  timer_id = timer.setInterval(CHECK_TIMER, checkAll);
 
-  //calibrate();
+  // light Yellow LED
+  LOG("Set yellow led start blink for 2 seconds = (20x(50+50)) ms, then remain up");
+  digitalWrite(YELLOW_LED_PIN, HIGH);
+  for(unsigned char index = 0; index < 10; index ++) {
+    delay(50);
+    digitalWrite(YELLOW_LED_PIN, LOW);
+    delay(50);
+    digitalWrite(YELLOW_LED_PIN, HIGH);
+  }
 
-  LOG("[setup] Move servo");
-  servoInit();
-  servoSetPosition(MAX_SERVO_POSITION/2);
-  LOG("[setup] Start distance timer");
-  distance_timer_id = timer.setInterval(DISTANCE_TIMER, checkDistance);
+  calibrate();
+  LOG("[setup] go to loop");
+}
+
+
+/*
+ * parse - Get command from bluetooth connection
+ * Each command is a simple TLV encoded and always starts with a starting 
+ * sync tag (0x47) and a command tag (1 byte)
+ * It has a 'sign' field (1 byte) that indicates if the value is negative (1) or not (0)
+ * Then, comes the value as a 16 bits integer.
+ * command: 0x47 CC SS VV VV
+ * 
+ */
+int parse(unsigned char *buf) {
+  int           index    = 0;
+  unsigned char command  = 0;
+  unsigned char value    = 0;
+  unsigned char checksum = 0;
+  unsigned char verif    = 0;
+  
+  // check if buffer starts with a sync tag 0x47
+  if( buf[index++] != 0x47 ) {
+    LOG("! not a command");
+    return -1;
+  }
+  // parses the command tag and sign
+  command   = buf[index++];
+  value     = buf[index++];
+  checksum  = buf[index++];
+
+  verif = 0x47 ^ command ^ value;
+  
+  if( verif != checksum ) {
+    LOG("! checksum error");
+    return -1;
+  }
+  
+  LOG("Received command = 0x%02X - value = 0x%02X", command, value);
+  
+  if( command == 0x01 ) {        // up
+    motors.setLeftSpeed(2*value);
+    motors.setRightSpeed(2*value);
+  } else if( command == 0x02 ) { // left
+    motors.setLeftSpeed(-2*value);
+    motors.setRightSpeed(2*value);
+  } else if( command == 0x04 ) { // right
+    motors.setLeftSpeed(2*value);
+    motors.setRightSpeed(-2*value);
+  } else if( command == 0x08 ) { // down
+    motors.setLeftSpeed(-2*value);
+    motors.setRightSpeed(-2*value);
+  } /* else if( command == 0x10 ) { // servo 
+    servoSetPosition(30*value);
+  }*/
+  return 0;
 }
 
 /*
  * Loop function, run over and over again
  */
 void loop() {
-/*  float heading, relative_heading;
+  if (SerialBluetooth.available() > 0 ) {    // if COM port is not empty   
+    INBYTE = SerialBluetooth.read();         // read next available byte
+    if( isSync == true || INBYTE == 0x47 ) { // synced
+      isSync = true;
+      buffer[index++]=INBYTE;
+      if(index == CMD_LEN) {
+        index=0;
+        isSync = false;
+        parse(buffer);
+      }
+    }
+  }
+  timer.run();
+}
+
+void checkAll() {
+  LOG("CHECK ALL");
+  getHeading();
+  getDistance();
+  getMemory();
+  getBattery();
+}
+
+/*
+ * Data monitoring
+ */
+
+int getHeading() {
+  float heading, relative_heading;
   int speed;
   static float target_heading = averageHeading();
 
@@ -146,122 +255,24 @@ void loop() {
 
   // This gives us the relative heading with respect to the target angle
   relative_heading = relativeHeading(heading, target_heading);
-
-  LOG("[loop] Target heading: %d", target_heading);
-  LOG("[loop] \t- Actual heading: %d", heading);
-  LOG("[loop] \t- Difference: %d", relative_heading);
-*/
-  timer.run();
-
-  if(step%5 == 0) {
-    getDistanceLeft();
-  }
-  else if(step%5 == 1) {
-    getDistanceRight();
-  }
-  else if(step%5 == 2) {
-    lookForward();
-  }
-  else if(step%5 == 3 && isTurning == false) {
-    startSpin();
-  }
-  else if(step%5 == 4 && isMoving == false) {
-    startMove();
-  }
+  
+  btPublish("heading", relative_heading);
 }
 
-void getDistanceLeft() {
-  LOG("[getDistanceLeft]");
-  isMoving = false;
-  isTurning = false;
-  // check distance to the left
-  servoSetPosition(SERVO_LEFT_POS);
-  delay(SERVO_DELAY);
-  checkDistance();
-  leftDistance = distance;
-  step++;
+void getDistance() {
+  int distance = measureDistance();
+  btPublish("distance", distance);
+  //beep(distance*10, 1000/(distance+1));
 }
 
-
-void getDistanceRight() {
-  LOG("[getDistanceRight]");
-  isMoving = false;
-  isTurning = false;
-  servoSetPosition(SERVO_RIGHT_POS);
-  delay(SERVO_DELAY);
-  checkDistance();
-  rightDistance = distance;
-  step++;
+void getMemory() {
+  int free = freeMemory();
+  btPublish("ram", free);
 }
 
-void lookForward() {
-  LOG("[lookForward]");
-  isMoving = false;
-  isTurning = false;
-  servoSetPosition(SERVO_CENTRAL_POS);
-  step++;
-}
-
-void startSpin() {
-  LOG("[startSpin]");
-  isMoving = false;
-  isTurning = true;
-  if(leftDistance > rightDistance) {
-    LOG("[startSpin] Turn Left");
-    go(SPIN_SPEED, -SPIN_SPEED, SPIN_STEP);
-  }
-  else if(rightDistance > leftDistance) {
-    LOG("[startSpin] Turn Right");
-    go(-SPIN_SPEED, SPIN_SPEED, SPIN_STEP);
-  }
-}
-
-void startMove() {
-  LOG("[startMove]");
-  isMoving = true;
-  isTurning = false;
-  go(MOTOR_SPEED, MOTOR_SPEED, MOTOR_STEP);
-}
-
-/********************************
- * Motors command functions
- ********************************/
-
-void stopMotorsOnTime() {
-  LOG("[stopMotorsOnTime] Stop both motors");
-  motors.setLeftSpeed(0);
-  motors.setRightSpeed(0);
-  if(isTurning == true) {
-    step++;
-  }
-}
-
-void stopMotorsAtDistance() {
-  LOG("[stopMotorsAtDistance] Stop both motors");
-  motors.setLeftSpeed(0);
-  motors.setRightSpeed(0);
-  if(isTurning == true) {
-    step++;
-  }
-}
-
-void go(int leftSpeed, int rightSpeed, long timer_duration) {
-  motors.setLeftSpeed(leftSpeed);
-  motors.setRightSpeed(rightSpeed);
-  LOG("[go] SetTimeout");
-  motor_timer_id = timer.setTimeout(timer_duration, stopMotorsOnTime);
-}
-
-void checkDistance() {
-  distance = measureDistance();
-//  LOG("[checkDistance] Distance : %d", distance);
-  beep(distance*10, 1000/(distance+1));
-
-  // prevent from case pulsein function returns 0 (no pulse before timeout ends)
-  if((distance > 0) && (distance < MIN_DISTANCE) && (isMoving == true)) {
-    stopMotorsAtDistance();
-    step++;
-  }
+void getBattery() {
+  unsigned int batteryVoltage = analogRead(BATTERY_LEVEL) * 5000L * 3/2 / 1023;
+  btPublish("battery", batteryVoltage);
 }
 
 /*
